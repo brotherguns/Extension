@@ -2,23 +2,23 @@
     {
         "name": "AnimePahe",
         "id": 482964175,
-        "baseUrl": "https://animepahe.com",
+        "baseUrl": "https://animepahe.pw",
         "lang": "en",
         "typeSource": "single",
         "iconUrl": "https://www.google.com/s2/favicons?sz=256&domain=https://animepahe.com/",
         "dateFormat": "",
         "dateFormatLocale": "",
         "isNsfw": false,
-        "hasCloudflare": false,
+        "hasCloudflare": true,
         "sourceCodeUrl": "https://raw.githubusercontent.com/brotherguns/Extension/refs/heads/main/animepahe.js",
         "apiUrl": "",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "isManga": false,
         "itemType": 1,
         "isFullData": false,
         "appMinVerReq": "0.5.0",
         "additionalParams": "",
         "sourceCodeLanguage": 1,
-        "notes": "Ported from CloudStream. SUB/DUB with Kwik extractor."
+        "notes": ""
     }
 ]
