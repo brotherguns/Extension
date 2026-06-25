@@ -1,12 +1,14 @@
 [
   {
+    "id": "1",
     "name": "AnimePahe",
     "lang": "en",
     "baseUrl": "https://animepahe.ru",
     "iconUrl": "https://www.google.com/s2/favicons?sz=64&domain=https://animepahe.ru/",
-    "typeSource": "single",
-    "isManga": false,
+    "itemType": 1,
     "version": "1.0.0",
-    "pkgPath": "https://raw.githubusercontent.com/brotherguns/Extension/main/animepahe.js"
+    "sourceCodeUrl": "https://raw.githubusercontent.com/brotherguns/Extension/main/animepahe.js",
+    "sourceCodeLanguage": 1,
+    "isNsfw": false
   }
 ]
