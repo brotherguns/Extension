@@ -1,14 +1,24 @@
 [
-  {
-    "id": "1",
-    "name": "AnimePahe",
-    "lang": "en",
-    "baseUrl": "https://animepahe.ru",
-    "iconUrl": "https://www.google.com/s2/favicons?sz=64&domain=https://animepahe.ru/",
-    "itemType": 1,
-    "version": "1.0.0",
-    "sourceCodeUrl": "https://raw.githubusercontent.com/brotherguns/Extension/main/animepahe.js",
-    "sourceCodeLanguage": 1,
-    "isNsfw": false
-  }
+    {
+        "name": "AnimePahe",
+        "id": 482964175,
+        "baseUrl": "https://animepahe.com",
+        "lang": "en",
+        "typeSource": "single",
+        "iconUrl": "https://raw.githubusercontent.com/brotherguns/Extension/refs/heads/main/javascript/anime/src/en/animepahe/icon.png",
+        "dateFormat": "",
+        "dateFormatLocale": "",
+        "isNsfw": false,
+        "hasCloudflare": false,
+        "sourceCodeUrl": "https://raw.githubusercontent.com/brotherguns/Extension/refs/heads/main/javascript/anime/src/en/animepahe/animepahe.js",
+        "apiUrl": "",
+        "version": "1.0.0",
+        "isManga": false,
+        "itemType": 1,
+        "isFullData": false,
+        "appMinVerReq": "0.5.0",
+        "additionalParams": "",
+        "sourceCodeLanguage": 1,
+        "notes": "Ported from CloudStream. SUB/DUB with Kwik extractor."
+    }
 ]
