@@ -3,12 +3,13 @@ const mangayomiSources = [
     "name": "AnimePahe",
     "lang": "en",
     "id": 482964175,
-    "baseUrl": "https://animepahe.com",
+    "baseUrl": "https://animepahe.pw",
     "apiUrl": "",
     "iconUrl": "https://www.google.com/s2/favicons?sz=256&domain=https://animepahe.com/",
     "typeSource": "single",
     "itemType": 1,
-    "version": "1.0.0",
+    "hasCloudflare": true,
+    "version": "1.0.1",
     "pkgPath": "anime/src/en/animepahe.js"
   }
 ];
@@ -52,7 +53,7 @@ class DefaultExtension extends MProvider {
       list.push({
         name: item.anime_title,
         imageUrl: item.snapshot || "",
-        link: "/anime/" + item.anime_session
+        link: "/a/" + item.anime_session + "/" + encodeURIComponent(item.anime_title)
       });
     }
     return { list: list, hasNextPage: true };
@@ -70,7 +71,7 @@ class DefaultExtension extends MProvider {
       list.push({
         name: item.title,
         imageUrl: item.poster || "",
-        link: "/anime/" + item.session
+        link: "/a/" + item.session + "/" + encodeURIComponent(item.title)
       });
     }
     return { list: list, hasNextPage: false };
@@ -80,16 +81,39 @@ class DefaultExtension extends MProvider {
 
   async getDetail(url) {
     var baseUrl = this.source.baseUrl;
-    var slug = url.replace(baseUrl, "");
-    var session = slug.replace("/anime/", "");
+    var cleanUrl = url.replace(baseUrl, "");
 
-    var body = await this.req(slug);
+    // Parse session and name from our link format: /a/SESSION/ENCODED_NAME
+    var parts = cleanUrl.replace("/a/", "").split("/");
+    var session = parts[0];
+    var animeName = parts.length > 1 ? decodeURIComponent(parts[1]) : "";
+
+    // If session looks stale, re-search
+    if (!session || session.length < 3) {
+      if (animeName) {
+        var searchResult = await this.search(animeName, 1, []);
+        if (searchResult.list.length > 0) {
+          var freshLink = searchResult.list[0].link;
+          session = freshLink.replace("/a/", "").split("/")[0];
+        }
+      }
+      if (!session || session.length < 3) {
+        return { chapters: [] };
+      }
+    }
+
+    // Fetch anime page
+    var body = await this.req("/anime/" + session);
     var doc = new Document(body);
 
-    var title = doc.selectFirst("span.sr-only.unselectable").text;
-    if (!title || title.length < 1) {
-      title = doc.selectFirst("h2.japanese").text;
+    var name = doc.selectFirst("span.sr-only.unselectable").text;
+    if (!name || name.length < 1) {
+      name = doc.selectFirst("h2.japanese").text;
     }
+    if (!name || name.length < 1) {
+      name = animeName;
+    }
+
     var imageUrl = doc.selectFirst(".anime-poster a").attr("href");
     var description = doc.selectFirst(".anime-synopsis").text;
 
@@ -106,16 +130,19 @@ class DefaultExtension extends MProvider {
       status = 1;
     }
 
+    // Fetch episodes
     var chapters = await this.fetchEpisodes(session);
 
+    console.log("AnimePahe: found " + chapters.length + " episodes for session " + session);
+
     return {
-      title: title,
+      name: name,
       imageUrl: imageUrl,
       description: description,
       status: status,
       genre: genre,
       chapters: chapters,
-      link: slug
+      link: "/a/" + session + "/" + encodeURIComponent(name)
     };
   }
 
@@ -123,6 +150,8 @@ class DefaultExtension extends MProvider {
     var chapters = [];
     try {
       var body = await this.req("/api?m=release&id=" + session + "&sort=episode_asc&page=1");
+      console.log("AnimePahe episodes API response length: " + body.length);
+
       var json = JSON.parse(body);
       var lastPage = json.last_page || 1;
 
@@ -134,11 +163,11 @@ class DefaultExtension extends MProvider {
           var pageJson = JSON.parse(pageBody);
           this.addEpisodes(chapters, pageJson.data, session);
         } catch (e) {
-          console.log("Episode page error: " + e);
+          console.log("AnimePahe: episode page " + p + " error: " + e);
         }
       }
     } catch (e) {
-      console.log("Episodes error: " + e);
+      console.log("AnimePahe: episodes fetch FAILED: " + e);
     }
     return chapters;
   }
@@ -230,7 +259,7 @@ class DefaultExtension extends MProvider {
       }
 
       if (!unpacked || unpacked.length < 10) {
-        console.log("Kwik unpack failed for: " + kwikUrl);
+        console.log("AnimePahe: kwik unpack failed for " + kwikUrl);
         return videos;
       }
 
@@ -247,7 +276,7 @@ class DefaultExtension extends MProvider {
         });
       }
     } catch (e) {
-      console.log("Kwik error: " + e);
+      console.log("AnimePahe: kwik error: " + e);
     }
     return videos;
   }
