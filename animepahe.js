@@ -7,7 +7,7 @@ const mangayomiSources = [
     "iconUrl": "https://www.google.com/s2/favicons?sz=64&domain=https://animepahe.ru/",
     "typeSource": "single",
     "isManga": false,
-    "version": "1.0.0",
+    "version": "1.0.1",
     "dateFormat": "",
     "dateFormatLocale": "",
     "pkgPath": "anime/src/en/animepahe.js"
@@ -20,143 +20,138 @@ class DefaultExtension extends MProvider {
     this.baseUrl = "https://animepahe.ru";
   }
 
-  get supportsLatest() {
-    return true;
-  }
+  get supportsLatest() { return true; }
 
-  getHeaders(url) {
+  get headers() {
     return {
       "Cookie": "__ddg2_=1234567890",
       "Referer": this.baseUrl + "/",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     };
   }
 
-  // ─── Home / Latest ────────────────────────────────────────────────────────
+  // ─── Latest / Popular ─────────────────────────────────────────────────────
 
-  async getPopular(page) {
-    return this.getLatestUpdates(page);
-  }
+  async getPopular(page) { return this.getLatestUpdates(page); }
 
   async getLatestUpdates(page) {
-    const url = `${this.baseUrl}/api?m=airing&page=${page}`;
-    const res = await new Client().get(url, this.getHeaders());
+    const res = await new Client().get(`${this.baseUrl}/api?m=airing&page=${page}`, this.headers);
     const json = JSON.parse(res.body);
-    const list = [];
-    for (const item of (json.data || [])) {
-      list.push({
-        name: item.anime_title,
-        imageUrl: item.snapshot || "",
-        link: JSON.stringify({ session: item.anime_session, name: item.anime_title }),
-      });
-    }
+    const list = (json.data || []).map(item => ({
+      name: item.anime_title,
+      imageUrl: item.snapshot || "",
+      link: JSON.stringify({ session: item.anime_session, name: item.anime_title, ts: Date.now() }),
+    }));
     return { list, hasNextPage: true };
   }
 
   // ─── Search ───────────────────────────────────────────────────────────────
 
   async search(query, page, filters) {
-    const url = `${this.baseUrl}/api?m=search&l=8&q=${encodeURIComponent(query)}`;
-    const res = await new Client().get(url, this.getHeaders());
+    const res = await new Client().get(
+      `${this.baseUrl}/api?m=search&l=8&q=${encodeURIComponent(query)}`,
+      this.headers
+    );
     const json = JSON.parse(res.body);
-    const list = [];
-    for (const item of (json.data || [])) {
-      list.push({
-        name: item.title,
-        imageUrl: item.poster || "",
-        link: JSON.stringify({ session: item.session, name: item.title }),
-      });
-    }
+    const list = (json.data || []).map(item => ({
+      name: item.title,
+      imageUrl: item.poster || "",
+      link: JSON.stringify({ session: item.session, name: item.title, ts: Date.now() }),
+    }));
     return { list, hasNextPage: false };
   }
 
   // ─── Detail ───────────────────────────────────────────────────────────────
 
   async getDetail(url) {
-    // url is a JSON string { session, name }
-    let session;
-    try {
-      session = JSON.parse(url).session;
-    } catch (_) {
-      // fallback: raw session string
-      session = url;
+    let parsed;
+    try { parsed = JSON.parse(url); } catch (_) { parsed = { session: url, name: "", ts: 0 }; }
+
+    let session = parsed.session;
+    const name = parsed.name || "";
+    const ts = parsed.ts || 0;
+
+    // Re-search if session is older than 10 minutes (mirrors Kotlin logic)
+    if (name && ts && (Date.now() - ts) > 10 * 60 * 1000) {
+      try {
+        const refreshed = await this.search(name, 1, null);
+        if (refreshed.list && refreshed.list.length > 0) {
+          const match = refreshed.list[0];
+          session = JSON.parse(match.link).session;
+        }
+      } catch (_) {}
     }
 
-    const pageUrl = `${this.baseUrl}/anime/${session}`;
-    const res = await new Client().get(pageUrl, this.getHeaders());
+    // Fetch anime detail page
+    const res = await new Client().get(`${this.baseUrl}/anime/${session}`, this.headers);
     const doc = new Document(res.body);
 
-    const name =
+    const name2 =
       doc.selectFirst("span.sr-only.unselectable")?.text ||
       doc.selectFirst("h2.japanese")?.text ||
-      "";
+      name;
 
-    const imageUrl = doc.selectFirst(".anime-poster a")?.getHref || "";
-
+    const imageUrl = doc.selectFirst(".anime-poster a")?.attr("href") || "";
     const description = doc.selectFirst(".anime-synopsis")?.text || "";
 
-    const statusText = doc.selectFirst("a[href='/anime/airing']")
-      ? "0" // Ongoing
-      : doc.selectFirst("a[href='/anime/completed']")
-      ? "1" // Completed
-      : "5";
-    const status = parseInt(statusText);
+    const status =
+      doc.selectFirst("a[href='/anime/airing']") ? 0 :
+      doc.selectFirst("a[href='/anime/completed']") ? 1 : 5;
 
-    const genre = [];
-    for (const el of doc.select(".anime-genre > ul a")) {
-      genre.push(el.text);
-    }
+    const genre = doc.select(".anime-genre > ul a").map(el => el.text);
 
-    // Episode list — fetch all pages
     const episodes = await this._fetchAllEpisodes(session);
 
-    return {
-      name,
-      imageUrl,
-      description,
-      status,
-      genre,
-      episodes,
-    };
+    return { name: name2, imageUrl, description, status, genre, episodes };
   }
 
   async _fetchAllEpisodes(session) {
     const episodes = [];
+    let lastPage = 1;
 
-    const firstUrl = `${this.baseUrl}/api?m=release&id=${session}&sort=episode_asc&page=1`;
-    const firstRes = await new Client().get(firstUrl, this.getHeaders());
-    const firstJson = JSON.parse(firstRes.body);
+    try {
+      const firstRes = await new Client().get(
+        `${this.baseUrl}/api?m=release&id=${session}&sort=episode_asc&page=1`,
+        this.headers
+      );
+      const firstJson = JSON.parse(firstRes.body);
+      lastPage = firstJson.last_page || 1;
 
-    const lastPage = firstJson.last_page || 1;
-
-    // Collect episodes from first page
-    for (const ep of (firstJson.data || [])) {
-      episodes.push(this._makeEpisode(session, ep));
-    }
-
-    // Fetch remaining pages
-    for (let p = 2; p <= lastPage; p++) {
-      const pUrl = `${this.baseUrl}/api?m=release&id=${session}&sort=episode_asc&page=${p}`;
-      const pRes = await new Client().get(pUrl, this.getHeaders());
-      const pJson = JSON.parse(pRes.body);
-      for (const ep of (pJson.data || [])) {
+      for (const ep of (firstJson.data || [])) {
         episodes.push(this._makeEpisode(session, ep));
       }
+    } catch (e) {
+      return episodes;
+    }
+
+    // Fetch remaining pages concurrently (up to 5 at a time to avoid hammering)
+    for (let p = 2; p <= lastPage; p++) {
+      try {
+        const res = await new Client().get(
+          `${this.baseUrl}/api?m=release&id=${session}&sort=episode_asc&page=${p}`,
+          this.headers
+        );
+        const json = JSON.parse(res.body);
+        for (const ep of (json.data || [])) {
+          episodes.push(this._makeEpisode(session, ep));
+        }
+      } catch (_) {}
     }
 
     return episodes;
   }
 
   _makeEpisode(session, ep) {
-    const epData = JSON.stringify({
-      session,
-      episode_session: ep.session,
-      episode: ep.episode,
-    });
     return {
       name: ep.title ? ep.title : `Episode ${ep.episode}`,
-      url: epData,
+      url: JSON.stringify({
+        session,
+        episode_session: ep.session,
+        episode: ep.episode,
+      }),
       imageUrl: ep.snapshot || "",
       dateUpload: ep.created_at || "",
+      episodeNumber: ep.episode,
     };
   }
 
@@ -164,48 +159,41 @@ class DefaultExtension extends MProvider {
 
   async getVideoList(url) {
     let epInfo;
-    try {
-      epInfo = JSON.parse(url);
-    } catch (_) {
-      return [];
-    }
+    try { epInfo = JSON.parse(url); } catch (_) { return []; }
 
     const playUrl = `${this.baseUrl}/play/${epInfo.session}/${epInfo.episode_session}`;
-    const res = await new Client().get(playUrl, this.getHeaders());
+    const res = await new Client().get(playUrl, this.headers);
     const doc = new Document(res.body);
 
     const videos = [];
 
-    // Stream buttons (#resolutionMenu)
     for (const btn of doc.select("#resolutionMenu button")) {
-      const dubSpan = btn.selectFirst("span")?.text?.toLowerCase() || "";
-      const type = dubSpan.includes("eng") ? "DUB" : "SUB";
+      const dubText = (btn.selectFirst("span")?.text || "").toLowerCase();
+      const type = dubText.includes("eng") ? "DUB" : "SUB";
       const text = btn.text;
-      const qualityMatch = text.match(/(.+?)\s+·\s+(\d{3,4}p)/);
-      const source = qualityMatch ? qualityMatch[1].trim() : "Unknown";
-      const quality = qualityMatch ? qualityMatch[2] : "";
-      const href = btn.attr("data-src");
+      const m = text.match(/(.+?)\s+·\s+(\d{3,4}p)/);
+      const source = m ? m[1].trim() : "Unknown";
+      const quality = m ? m[2] : "";
+      const href = btn.attr("data-src") || "";
 
-      if (href && href.includes("kwik")) {
-        const kwikVideos = await this._extractKwik(href, `AnimePahe ${source} [${type}] ${quality}`);
-        videos.push(...kwikVideos);
+      if (href.includes("kwik")) {
+        const kwikVids = await this._extractKwik(href, `AnimePahe ${source} [${type}] ${quality}`);
+        videos.push(...kwikVids);
       }
     }
 
-    // Download links (#pickDownload)
     for (const a of doc.select("div#pickDownload > a")) {
-      const href = a.attr("href");
-      if (!href) continue;
-      const dubSpan = a.selectFirst("span")?.text?.toLowerCase() || "";
-      const type = dubSpan.includes("eng") ? "DUB" : "SUB";
+      const href = a.attr("href") || "";
+      const dubText = (a.selectFirst("span")?.text || "").toLowerCase();
+      const type = dubText.includes("eng") ? "DUB" : "SUB";
       const text = a.text;
-      const qualityMatch = text.match(/(.+?)\s+·\s+(\d{3,4}p)/);
-      const source = qualityMatch ? qualityMatch[1].trim() : "Unknown";
-      const quality = qualityMatch ? qualityMatch[2] : "";
+      const m = text.match(/(.+?)\s+·\s+(\d{3,4}p)/);
+      const source = m ? m[1].trim() : "Unknown";
+      const quality = m ? m[2] : "";
 
       if (href.includes("kwik")) {
-        const kwikVideos = await this._extractKwik(href, `AnimePahe ${source} [${type}] ${quality}`);
-        videos.push(...kwikVideos);
+        const kwikVids = await this._extractKwik(href, `AnimePahe Pahe ${source} [${type}] ${quality}`);
+        videos.push(...kwikVids);
       }
     }
 
@@ -215,116 +203,63 @@ class DefaultExtension extends MProvider {
   // ─── Kwik extractor ───────────────────────────────────────────────────────
 
   async _extractKwik(kwikUrl, label) {
-    const videos = [];
     try {
       const res = await new Client().get(kwikUrl, {
         "Referer": this.baseUrl + "/",
+        "User-Agent": this.headers["User-Agent"],
         "Cookie": "__ddg2_=1234567890",
       });
       const html = res.body;
 
-      // Find p,a,c,k,e,d packed JS
-      const scriptMatch = html.match(/\(function\(p,a,c,k,e,d\)[\s\S]*?<\/script>/);
-      if (!scriptMatch) return videos;
+      const scriptMatch = html.match(/\(function\(p,a,c,k,e,d\)[\s\S]+?(?=<\/script>)/);
+      if (!scriptMatch) return [];
 
-      const packed = scriptMatch[0].replace(/<\/script>$/, "");
-      const unpacked = this._unpack(packed);
-      if (!unpacked) return videos;
+      const unpacked = this._unpack(scriptMatch[0]);
+      if (!unpacked) return [];
 
-      // Extract m3u8 URL
-      const m3u8Match = unpacked.match(/source=\s*'(.*?\.m3u8.*?)'/);
-      if (!m3u8Match) return videos;
-      const m3u8Url = m3u8Match[1];
+      const m3u8Match = unpacked.match(/source=\s*'(https?:[^']+\.m3u8[^']*)'/);
+      if (!m3u8Match) return [];
 
-      const title = (html.match(/<title>(.*?)<\/title>/) || [])[1] || label;
-
-      videos.push({
-        url: m3u8Url,
-        originalUrl: m3u8Url,
+      return [{
+        url: m3u8Match[1],
+        originalUrl: m3u8Match[1],
         quality: label,
         headers: {
           "Referer": "https://kwik.cx/",
           "Origin": "https://kwik.cx",
+          "User-Agent": this.headers["User-Agent"],
         },
-      });
-
-      // Also produce a direct MP4 download link
-      const mp4Url = m3u8Url
-        .replace("/stream/", "/mp4/")
-        .replace(/\/[^/]+$/, "");
-      const fileName = title.replace(/\.mp4$/, "") + ".mp4";
-      videos.push({
-        url: `${mp4Url}?file=${encodeURIComponent(fileName)}`,
-        originalUrl: `${mp4Url}?file=${encodeURIComponent(fileName)}`,
-        quality: `${label} [Download]`,
-        headers: {
-          "Referer": kwikUrl,
-          "Origin": "https://kwik.cx",
-        },
-      });
-    } catch (e) {
-      // swallow per-extractor errors
+      }];
+    } catch (_) {
+      return [];
     }
-    return videos;
   }
 
-  // Dean Edwards p,a,c,k,e,d unpacker (JS port)
   _unpack(source) {
     try {
-      const match = source.match(
-        /\}\('(.*)',(\d+),(\d+),'(.*?)'\.split\('\|'\)/
-      );
+      const match = source.match(/\}\s*\(\s*'([\s\S]+?)',\s*(\d+),\s*(\d+),\s*'([\s\S]+?)'\.split\('\|'\)/);
       if (!match) return null;
-      let [, payload, radix, count, symtab] = match;
-      radix = parseInt(radix);
-      symtab = symtab.split("|");
+      let [, payload, radixStr, , symtabStr] = match;
+      const radix = parseInt(radixStr);
+      const symtab = symtabStr.split("|");
+      const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
-      const unbase = (str) => {
-        const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        let result = 0;
-        for (const ch of str) {
-          result = result * radix + alphabet.indexOf(ch);
-        }
-        return result;
+      const unbase = str => {
+        let n = 0;
+        for (const ch of str) n = n * radix + alphabet.indexOf(ch);
+        return n;
       };
 
-      const lookup = (word) => {
+      return payload.replace(/\b(\w+)\b/g, word => {
         const idx = unbase(word);
-        return symtab[idx] || word;
-      };
-
-      return payload.replace(/\b\w+\b/g, lookup);
-    } catch (_) {
-      return null;
-    }
+        return (idx < symtab.length && symtab[idx]) ? symtab[idx] : word;
+      });
+    } catch (_) { return null; }
   }
 
-  // ─── Unused for anime ─────────────────────────────────────────────────────
+  // ─── Stubs ────────────────────────────────────────────────────────────────
 
-  async getPageList(url) {
-    return [];
-  }
-
-  getFilterList() {
-    return [];
-  }
-
-  getSourcePreferences() {
-    return [
-      {
-        key: "animepahe_server",
-        listPreference: {
-          title: "Server",
-          summary: "",
-          valueIndex: 0,
-          entries: ["animepahe.ru", "animepahe.com", "animepahe.org"],
-          entryValues: [
-            "https://animepahe.ru",
-            "https://animepahe.com",
-            "https://animepahe.org",
-          ],
-        },
-      },
-    ];
-  }
+  async getPageList(url) { return []; }
+  getFilterList() { return []; }
+  getSourcePreferences() { return []; }
 }
