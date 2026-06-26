@@ -314,16 +314,25 @@ class DefaultExtension extends MProvider {
     if (epData && epData.providers) {
       // Build a map: epNumber -> { title, sub: [{prov,eid},...], dub: [{prov,eid},...] }
       var epMap = {};
+      var provKeys = Object.keys(epData.providers);
+      var categories = ["sub", "ssub", "dub"];
 
-      for (var pn in epData.providers) {
+      console.log("Miruro: providers found: " + provKeys.join(", "));
+
+      for (var pi = 0; pi < provKeys.length; pi++) {
+        var pn = provKeys[pi];
         var prov = epData.providers[pn];
         if (!prov || !prov.episodes) continue;
 
-        for (var cat in prov.episodes) {
+        var catKeys = Object.keys(prov.episodes);
+        console.log("Miruro: " + pn + " categories: " + catKeys.join(", "));
+
+        for (var ci = 0; ci < catKeys.length; ci++) {
+          var cat = catKeys[ci];
           var eps = prov.episodes[cat];
-          if (!eps) continue;
-          // Normalize category: ssub -> sub
-          var normCat = (cat === "ssub") ? "sub" : cat;
+          if (!eps || !eps.length) continue;
+
+          var isDub = (cat === "dub");
 
           for (var i = 0; i < eps.length; i++) {
             var ep = eps[i];
@@ -331,13 +340,11 @@ class DefaultExtension extends MProvider {
             if (!epMap[num]) {
               epMap[num] = { title: "", sub: [], dub: [] };
             }
-            // Keep the best title
             if (ep.title && ep.title.length > 0 && epMap[num].title.length === 0) {
               epMap[num].title = ep.title;
             }
-            // Add this source
-            var srcEntry = { prov: pn, eid: ep.id, cat: ep.audio || normCat };
-            if (normCat === "dub") {
+            var srcEntry = { prov: pn, eid: ep.id, cat: isDub ? "dub" : "sub" };
+            if (isDub) {
               epMap[num].dub.push(srcEntry);
             } else {
               epMap[num].sub.push(srcEntry);
@@ -348,10 +355,17 @@ class DefaultExtension extends MProvider {
 
       // Sort episode numbers
       var epNums = [];
-      for (var n in epMap) epNums.push(parseFloat(n));
+      var epKeys = Object.keys(epMap);
+      for (var i = 0; i < epKeys.length; i++) epNums.push(parseFloat(epKeys[i]));
       epNums.sort(function(a, b) { return a - b; });
 
-      // Create SUB chapters
+      // Log counts for debug
+      if (epNums.length > 0) {
+        var firstEp = epMap[epNums[0]];
+        console.log("Miruro: ep " + epNums[0] + " has " + firstEp.sub.length + " sub, " + firstEp.dub.length + " dub sources");
+      }
+
+      // Create chapters — SUB first, then DUB for each episode
       for (var ni = 0; ni < epNums.length; ni++) {
         var num = epNums[ni];
         var data = epMap[num];
@@ -370,12 +384,12 @@ class DefaultExtension extends MProvider {
         }
 
         if (data.dub.length > 0) {
-          var provNames = [];
-          for (var j = 0; j < data.dub.length; j++) provNames.push(data.dub[j].prov);
+          var dubProvNames = [];
+          for (var j = 0; j < data.dub.length; j++) dubProvNames.push(data.dub[j].prov);
           chapters.push({
             name: "E" + num + " - " + epTitle + " [DUB]",
             url: JSON.stringify({ aid: aniId, num: num, sources: data.dub }),
-            scanlator: provNames.join(", ") + " [DUB]"
+            scanlator: dubProvNames.join(", ") + " [DUB]"
           });
         }
       }
