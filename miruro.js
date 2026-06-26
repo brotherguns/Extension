@@ -380,17 +380,39 @@ class DefaultExtension extends MProvider {
         console.log("Miruro: ep " + epNums[0] + " has " + firstEp.sub.length + " sub, " + firstEp.dub.length + " dub sources");
       }
 
-      // Create one chapter per episode with ALL sources (sub + dub combined)
+      // Create one chapter per episode — limit sources to top providers
+      var topProvs = ["kiwi", "bee", "bonk", "ally", "pewe"];
       for (var ni = 0; ni < epNums.length; ni++) {
         var num = epNums[ni];
         var data = epMap[num];
         if (data.sub.length === 0 && data.dub.length === 0) continue;
 
         var epTitle = data.title || ("Episode " + num);
-        var allSources = data.sub.concat(data.dub);
+
+        // Pick top 3 sub + top 2 dub sources (prioritize reliable providers)
+        var pickTop = function(arr, max) {
+          var picked = [];
+          for (var p = 0; p < topProvs.length && picked.length < max; p++) {
+            for (var a = 0; a < arr.length; a++) {
+              if (arr[a].prov === topProvs[p]) { picked.push(arr[a]); break; }
+            }
+          }
+          // Fill remaining from whatever's left
+          for (var a = 0; a < arr.length && picked.length < max; a++) {
+            var dup = false;
+            for (var d = 0; d < picked.length; d++) { if (picked[d].prov === arr[a].prov) { dup = true; break; } }
+            if (!dup) picked.push(arr[a]);
+          }
+          return picked;
+        };
+
+        var bestSub = pickTop(data.sub, 3);
+        var bestDub = pickTop(data.dub, 2);
+        var allSources = bestSub.concat(bestDub);
+
         var tags = [];
-        if (data.sub.length > 0) tags.push("SUB");
-        if (data.dub.length > 0) tags.push("DUB");
+        if (bestSub.length > 0) tags.push("SUB");
+        if (bestDub.length > 0) tags.push("DUB");
 
         chapters.push({
           name: "E" + num + " - " + epTitle,
@@ -422,10 +444,28 @@ class DefaultExtension extends MProvider {
 
     var videos = [];
     var sources = ep.sources || [];
-
-    // Try every provider source for this episode
+    // Prioritize reliable providers, skip known-flaky ones
+    var reliable = ["kiwi", "bee", "bonk", "ally", "pewe"];
+    var sorted = [];
+    // Add reliable first
+    for (var ri = 0; ri < reliable.length; ri++) {
+      for (var si = 0; si < sources.length; si++) {
+        if (sources[si].prov === reliable[ri]) sorted.push(sources[si]);
+      }
+    }
+    // Add remaining
     for (var si = 0; si < sources.length; si++) {
-      var src = sources[si];
+      var dominated = false;
+      for (var ri = 0; ri < reliable.length; ri++) {
+        if (sources[si].prov === reliable[ri]) { dominated = true; break; }
+      }
+      if (!dominated) sorted.push(sources[si]);
+    }
+
+    // Try max 4 sources, stop early if we already have streams
+    var maxTries = Math.min(sorted.length, 4);
+    for (var si = 0; si < maxTries; si++) {
+      var src = sorted[si];
       try {
         var srcData = await this.pipe("sources", {
           episodeId: src.eid, provider: src.prov,
@@ -435,7 +475,7 @@ class DefaultExtension extends MProvider {
           for (var i = 0; i < srcData.streams.length; i++) {
             var s = srcData.streams[i];
             if (s.type === "hls" && s.url && s.isActive !== false) {
-              var label = src.prov + " " + (s.quality || "") + " [" + (s.audio || "sub").toUpperCase() + "]";
+              var label = src.prov + " " + (s.quality || "") + " [" + (s.audio || src.cat || "sub").toUpperCase() + "]";
               if (s.fansub) label += " " + s.fansub;
               var hdrs = {};
               if (s.referer) hdrs["Referer"] = s.referer;
@@ -446,6 +486,8 @@ class DefaultExtension extends MProvider {
       } catch(e) {
         console.log("Miruro: " + src.prov + " failed: " + e);
       }
+      // If we have enough streams, stop early
+      if (videos.length >= 4) break;
     }
 
     return videos;
