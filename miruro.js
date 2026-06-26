@@ -307,51 +307,76 @@ class DefaultExtension extends MProvider {
     var studio = info.studios && info.studios.nodes && info.studios.nodes.length > 0 ? info.studios.nodes[0].name : "";
     var status = info.status === "RELEASING" ? 0 : info.status === "FINISHED" ? 1 : 5;
 
-    // Episodes from Miruro
+    // Episodes from Miruro — merge ALL providers
     var epData = await this.pipe("episodes", { anilistId: aniId });
     var chapters = [];
 
     if (epData && epData.providers) {
-      for (var pi = 0; pi < this.provOrder.length; pi++) {
-        var pn = this.provOrder[pi];
+      // Build a map: epNumber -> { title, sub: [{prov,eid},...], dub: [{prov,eid},...] }
+      var epMap = {};
+
+      for (var pn in epData.providers) {
         var prov = epData.providers[pn];
         if (!prov || !prov.episodes) continue;
 
-        var subEps = prov.episodes["sub"] || [];
-        var ssubEps = prov.episodes["ssub"] || [];
-        var dubEps = prov.episodes["dub"] || [];
-        var eps = subEps.length > 0 ? subEps : (ssubEps.length > 0 ? ssubEps : dubEps);
+        for (var cat in prov.episodes) {
+          var eps = prov.episodes[cat];
+          if (!eps) continue;
+          // Normalize category: ssub -> sub
+          var normCat = (cat === "ssub") ? "sub" : cat;
 
-        if (eps.length > 0) {
           for (var i = 0; i < eps.length; i++) {
             var ep = eps[i];
-            var epName = ep.title && ep.title.length > 0 ? ep.title : "Episode " + ep.number;
-            chapters.push({
-              name: "E" + ep.number + " - " + epName,
-              url: JSON.stringify({
-                aid: aniId, eid: ep.id, prov: pn,
-                cat: ep.audio || "sub", num: ep.number
-              }),
-              scanlator: pn + " [" + (ep.audio || "sub").toUpperCase() + "]"
-            });
-          }
-
-          // Also add dub episodes if we picked sub
-          if (subEps.length > 0 && dubEps.length > 0) {
-            for (var i = 0; i < dubEps.length; i++) {
-              var ep = dubEps[i];
-              var epName = ep.title && ep.title.length > 0 ? ep.title : "Episode " + ep.number;
-              chapters.push({
-                name: "E" + ep.number + " - " + epName + " [DUB]",
-                url: JSON.stringify({
-                  aid: aniId, eid: ep.id, prov: pn,
-                  cat: "dub", num: ep.number
-                }),
-                scanlator: pn + " [DUB]"
-              });
+            var num = ep.number;
+            if (!epMap[num]) {
+              epMap[num] = { title: "", sub: [], dub: [] };
+            }
+            // Keep the best title
+            if (ep.title && ep.title.length > 0 && epMap[num].title.length === 0) {
+              epMap[num].title = ep.title;
+            }
+            // Add this source
+            var srcEntry = { prov: pn, eid: ep.id, cat: ep.audio || normCat };
+            if (normCat === "dub") {
+              epMap[num].dub.push(srcEntry);
+            } else {
+              epMap[num].sub.push(srcEntry);
             }
           }
-          break;
+        }
+      }
+
+      // Sort episode numbers
+      var epNums = [];
+      for (var n in epMap) epNums.push(parseFloat(n));
+      epNums.sort(function(a, b) { return a - b; });
+
+      // Create SUB chapters
+      for (var ni = 0; ni < epNums.length; ni++) {
+        var num = epNums[ni];
+        var data = epMap[num];
+        if (data.sub.length === 0 && data.dub.length === 0) continue;
+
+        var epTitle = data.title || ("Episode " + num);
+
+        if (data.sub.length > 0) {
+          var provNames = [];
+          for (var j = 0; j < data.sub.length; j++) provNames.push(data.sub[j].prov);
+          chapters.push({
+            name: "E" + num + " - " + epTitle,
+            url: JSON.stringify({ aid: aniId, num: num, sources: data.sub }),
+            scanlator: provNames.join(", ") + " [SUB]"
+          });
+        }
+
+        if (data.dub.length > 0) {
+          var provNames = [];
+          for (var j = 0; j < data.dub.length; j++) provNames.push(data.dub[j].prov);
+          chapters.push({
+            name: "E" + num + " - " + epTitle + " [DUB]",
+            url: JSON.stringify({ aid: aniId, num: num, sources: data.dub }),
+            scanlator: provNames.join(", ") + " [DUB]"
+          });
         }
       }
     }
@@ -377,26 +402,32 @@ class DefaultExtension extends MProvider {
     try { ep = JSON.parse(url); } catch(e) { return []; }
 
     var videos = [];
+    var sources = ep.sources || [];
 
-    // Try primary provider
-    try {
-      var srcData = await this.pipe("sources", {
-        episodeId: ep.eid, provider: ep.prov,
-        category: ep.cat || "", anilistId: ep.aid
-      });
-      if (srcData && srcData.streams) {
-        for (var i = 0; i < srcData.streams.length; i++) {
-          var s = srcData.streams[i];
-          if (s.type === "hls" && s.url && s.isActive !== false) {
-            var label = ep.prov + " " + (s.quality || "") + " [" + (s.audio || "sub").toUpperCase() + "]";
-            if (s.fansub) label += " " + s.fansub;
-            var hdrs = {};
-            if (s.referer) hdrs["Referer"] = s.referer;
-            videos.push({ url: s.url, originalUrl: s.url, quality: label, headers: hdrs });
+    // Try every provider source for this episode
+    for (var si = 0; si < sources.length; si++) {
+      var src = sources[si];
+      try {
+        var srcData = await this.pipe("sources", {
+          episodeId: src.eid, provider: src.prov,
+          category: src.cat || "", anilistId: ep.aid
+        });
+        if (srcData && srcData.streams) {
+          for (var i = 0; i < srcData.streams.length; i++) {
+            var s = srcData.streams[i];
+            if (s.type === "hls" && s.url && s.isActive !== false) {
+              var label = src.prov + " " + (s.quality || "") + " [" + (s.audio || "sub").toUpperCase() + "]";
+              if (s.fansub) label += " " + s.fansub;
+              var hdrs = {};
+              if (s.referer) hdrs["Referer"] = s.referer;
+              videos.push({ url: s.url, originalUrl: s.url, quality: label, headers: hdrs });
+            }
           }
         }
+      } catch(e) {
+        console.log("Miruro: " + src.prov + " failed: " + e);
       }
-    } catch(e) { console.log("Miruro source error: " + e); }
+    }
 
     return videos;
   }
