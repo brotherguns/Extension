@@ -243,7 +243,7 @@ class DefaultExtension extends MProvider {
     var res = await this.client.post(
       this.anilistUrl,
       { "Content-Type": "application/json", "Accept": "application/json" },
-      JSON.stringify({ query: query, variables: vars })
+      { query: query, variables: vars }
     );
     return JSON.parse(res.body);
   }
