@@ -380,33 +380,23 @@ class DefaultExtension extends MProvider {
         console.log("Miruro: ep " + epNums[0] + " has " + firstEp.sub.length + " sub, " + firstEp.dub.length + " dub sources");
       }
 
-      // Create chapters — SUB first, then DUB for each episode
+      // Create one chapter per episode with ALL sources (sub + dub combined)
       for (var ni = 0; ni < epNums.length; ni++) {
         var num = epNums[ni];
         var data = epMap[num];
         if (data.sub.length === 0 && data.dub.length === 0) continue;
 
         var epTitle = data.title || ("Episode " + num);
+        var allSources = data.sub.concat(data.dub);
+        var tags = [];
+        if (data.sub.length > 0) tags.push("SUB");
+        if (data.dub.length > 0) tags.push("DUB");
 
-        if (data.sub.length > 0) {
-          var provNames = [];
-          for (var j = 0; j < data.sub.length; j++) provNames.push(data.sub[j].prov);
-          chapters.push({
-            name: "E" + num + " - " + epTitle,
-            url: JSON.stringify({ aid: aniId, num: num, sources: data.sub }),
-            scanlator: provNames.join(", ") + " [SUB]"
-          });
-        }
-
-        if (data.dub.length > 0) {
-          var dubProvNames = [];
-          for (var j = 0; j < data.dub.length; j++) dubProvNames.push(data.dub[j].prov);
-          chapters.push({
-            name: "E" + num + " - " + epTitle + " [DUB]",
-            url: JSON.stringify({ aid: aniId, num: num, sources: data.dub }),
-            scanlator: dubProvNames.join(", ") + " [DUB]"
-          });
-        }
+        chapters.push({
+          name: "E" + num + " - " + epTitle,
+          url: JSON.stringify({ aid: aniId, num: num, sources: allSources }),
+          scanlator: tags.join("+") + " · " + allSources.length + " sources"
+        });
       }
     }
 
