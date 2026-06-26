@@ -188,28 +188,31 @@ function deobfuscate(body) {
   // inflate the deflate stream
   var deflateData = compressed.subarray(offset, compressed.length - 8);
   var inflated = tinf.inflate(deflateData, isize + 64);
-  // Proper UTF-8 decode
-  var str = "";
+  // Proper UTF-8 decode — use array + join for performance
+  var parts = [];
   var i = 0;
+  var chunk = "";
   while (i < inflated.length) {
     var c = inflated[i];
     if (c < 128) {
-      str += String.fromCharCode(c);
+      chunk += String.fromCharCode(c);
       i++;
     } else if (c < 224) {
-      str += String.fromCharCode(((c & 31) << 6) | (inflated[i+1] & 63));
+      chunk += String.fromCharCode(((c & 31) << 6) | (inflated[i+1] & 63));
       i += 2;
     } else if (c < 240) {
-      str += String.fromCharCode(((c & 15) << 12) | ((inflated[i+1] & 63) << 6) | (inflated[i+2] & 63));
+      chunk += String.fromCharCode(((c & 15) << 12) | ((inflated[i+1] & 63) << 6) | (inflated[i+2] & 63));
       i += 3;
     } else {
       var cp = ((c & 7) << 18) | ((inflated[i+1] & 63) << 12) | ((inflated[i+2] & 63) << 6) | (inflated[i+3] & 63);
       cp -= 0x10000;
-      str += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
+      chunk += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
       i += 4;
     }
+    if (chunk.length > 8192) { parts.push(chunk); chunk = ""; }
   }
-  return str.replace(/\0+$/, "");
+  if (chunk) parts.push(chunk);
+  return parts.join("").replace(/\0+$/, "");
 }
 
 // ─── Extension ──────────────────────────────────────────────────────────
@@ -322,20 +325,20 @@ class DefaultExtension extends MProvider {
     var studio = info.studios && info.studios.nodes && info.studios.nodes.length > 0 ? info.studios.nodes[0].name : "";
     var status = info.status === "RELEASING" ? 0 : info.status === "FINISHED" ? 1 : 5;
 
-    // Episodes from Miruro — merge ALL providers
+    // Episodes from Miruro — only process reliable providers
     var epData = await this.pipe("episodes", { anilistId: aniId });
     var chapters = [];
 
     if (epData && epData.providers) {
-      // Build a map: epNumber -> { title, sub: [{prov,eid},...], dub: [{prov,eid},...] }
       var epMap = {};
+      // Only process known-good providers to avoid slowdown
+      var useProvs = ["kiwi", "bee", "bonk", "ally", "pewe", "moo"];
       var provKeys = Object.keys(epData.providers);
-      var categories = ["sub", "ssub", "dub"];
 
       console.log("Miruro: providers found: " + provKeys.join(", "));
 
-      for (var pi = 0; pi < provKeys.length; pi++) {
-        var pn = provKeys[pi];
+      for (var pi = 0; pi < useProvs.length; pi++) {
+        var pn = useProvs[pi];
         var prov = epData.providers[pn];
         if (!prov || !prov.episodes) continue;
 
@@ -344,6 +347,7 @@ class DefaultExtension extends MProvider {
 
         for (var ci = 0; ci < catKeys.length; ci++) {
           var cat = catKeys[ci];
+          if (cat !== "sub" && cat !== "dub" && cat !== "ssub") continue;
           var eps = prov.episodes[cat];
           if (!eps || !eps.length) continue;
 
