@@ -131,9 +131,8 @@ var tinf = (function() {
   length_bits[28] = 0; length_base[28] = 258;
 
   return {
-    inflate: function(source) {
-      // Guess output size (4x input)
-      var dest = new Uint8Array(source.length * 8);
+    inflate: function(source, expectedSize) {
+      var dest = new Uint8Array(expectedSize || source.length * 32);
       var d = new Data(source, dest);
       var bfinal, btype;
       do {
@@ -184,17 +183,33 @@ function deobfuscate(body) {
   if (compressed[3] & 8) { while (compressed[offset++] !== 0); }
   if (compressed[3] & 16) { while (compressed[offset++] !== 0); }
   if (compressed[3] & 2) offset += 2;
+  // Read expected decompressed size from gzip footer (ISIZE, last 4 bytes)
+  var isize = compressed[compressed.length-4] | (compressed[compressed.length-3]<<8) | (compressed[compressed.length-2]<<16) | ((compressed[compressed.length-1]<<24)>>>0);
   // inflate the deflate stream
   var deflateData = compressed.subarray(offset, compressed.length - 8);
-  var inflated = tinf.inflate(deflateData);
-  // convert bytes to string
+  var inflated = tinf.inflate(deflateData, isize + 64);
+  // Proper UTF-8 decode
   var str = "";
-  for (var i = 0; i < inflated.length; i += 4096) {
-    var chunk = inflated.subarray(i, Math.min(i + 4096, inflated.length));
-    for (var j = 0; j < chunk.length; j++) str += String.fromCharCode(chunk[j]);
+  var i = 0;
+  while (i < inflated.length) {
+    var c = inflated[i];
+    if (c < 128) {
+      str += String.fromCharCode(c);
+      i++;
+    } else if (c < 224) {
+      str += String.fromCharCode(((c & 31) << 6) | (inflated[i+1] & 63));
+      i += 2;
+    } else if (c < 240) {
+      str += String.fromCharCode(((c & 15) << 12) | ((inflated[i+1] & 63) << 6) | (inflated[i+2] & 63));
+      i += 3;
+    } else {
+      var cp = ((c & 7) << 18) | ((inflated[i+1] & 63) << 12) | ((inflated[i+2] & 63) << 6) | (inflated[i+3] & 63);
+      cp -= 0x10000;
+      str += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
+      i += 4;
+    }
   }
-  // Handle UTF-8 multi-byte
-  try { return decodeURIComponent(escape(str)); } catch(e) { return str; }
+  return str.replace(/\0+$/, "");
 }
 
 // ─── Extension ──────────────────────────────────────────────────────────
