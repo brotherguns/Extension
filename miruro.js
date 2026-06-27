@@ -360,6 +360,12 @@ class DefaultExtension extends MProvider {
     if (body.indexOf("H4sI") === 0) {
       return JSON.parse(deobfuscate(body));
     }
+    // Stale/invalid episode IDs make the pipe return an HTML error page instead
+    // of JSON — detect it and fail cleanly so callers can skip this source.
+    var t = body.charAt(0);
+    if (t !== "{" && t !== "[") {
+      throw new Error("pipe(" + path + "): non-JSON response (" + body.slice(0, 40).replace(/\s+/g, " ") + ")");
+    }
     return JSON.parse(body);
   }
 
@@ -369,7 +375,35 @@ class DefaultExtension extends MProvider {
       { "Content-Type": "application/json", "Accept": "application/json" },
       { query: query, variables: vars }
     );
-    return JSON.parse(res.body);
+    var body = res.body || "";
+    var t = body.charAt(0);
+    if (t !== "{" && t !== "[") {
+      // AniList rate-limit / gateway pages aren't JSON; surface a clean error.
+      throw new Error("anilist: non-JSON response (status " + (res.statusCode || "?") + ")");
+    }
+    return JSON.parse(body);
+  }
+
+  // Run an AniList Page query and safely extract list + hasNextPage, tolerating
+  // error responses (data:null on rate-limit / bad query) without crashing.
+  async _anilistPage(query, vars) {
+    var d;
+    try {
+      d = await this.anilist(query, vars);
+    } catch (e) {
+      console.log("Miruro: AniList request failed: " + e);
+      return { list: [], hasNextPage: false };
+    }
+    if (!d || !d.data || !d.data.Page) {
+      var msg = d && d.errors && d.errors.length ? d.errors[0].message : "no data";
+      console.log("Miruro: AniList returned no Page (" + msg + ")");
+      return { list: [], hasNextPage: false };
+    }
+    var page = d.data.Page;
+    return {
+      list: this._mapList(page.media || []),
+      hasNextPage: page.pageInfo ? page.pageInfo.hasNextPage : false
+    };
   }
 
   // ─── Mapping helpers ──────────────────────────────────────────────────
@@ -416,16 +450,14 @@ class DefaultExtension extends MProvider {
 
   async getPopular(page) {
     var q = "query($p:Int){Page(page:$p,perPage:20){pageInfo{hasNextPage}media(type:ANIME,sort:TRENDING_DESC){id title{romaji english native}coverImage{large extraLarge}}}}";
-    var d = await this.anilist(q, { p: page });
-    return { list: this._mapList(d.data.Page.media), hasNextPage: d.data.Page.pageInfo.hasNextPage };
+    return this._anilistPage(q, { p: page });
   }
 
   get supportsLatest() { return true; }
 
   async getLatestUpdates(page) {
     var q = "query($p:Int){Page(page:$p,perPage:20){pageInfo{hasNextPage}media(type:ANIME,sort:UPDATED_AT_DESC,status:RELEASING){id title{romaji english native}coverImage{large extraLarge}}}}";
-    var d = await this.anilist(q, { p: page });
-    return { list: this._mapList(d.data.Page.media), hasNextPage: d.data.Page.pageInfo.hasNextPage };
+    return this._anilistPage(q, { p: page });
   }
 
   // ─── Search + Filters ─────────────────────────────────────────────────
@@ -447,17 +479,21 @@ class DefaultExtension extends MProvider {
       }
     }
     // If no text query, default sort to TRENDING for a useful browse experience.
-    if ((!query || query.length === 0) && sort === "SEARCH_MATCH") sort = "TRENDING_DESC";
+    var hasQuery = !!(query && query.length);
+    var hasGenre = genreIn.length > 0;
+    if (!hasQuery && sort === "SEARCH_MATCH") sort = "TRENDING_DESC";
 
-    var q = "query($p:Int,$s:String,$g:[String],$sort:[MediaSort]){Page(page:$p,perPage:20){pageInfo{hasNextPage}media(type:ANIME" +
-            (query && query.length ? ",search:$s" : "") +
-            (genreIn.length ? ",genre_in:$g" : "") +
-            ",sort:$sort){id title{romaji english native}coverImage{large extraLarge}}}}";
+    // Build declarations and field args in lockstep — GraphQL rejects the whole
+    // query if a declared variable ($s/$g) is never referenced in the body.
+    var decls = "$p:Int,$sort:[MediaSort]";
+    var args = "type:ANIME,sort:$sort";
     var vars = { p: page, sort: [sort] };
-    if (query && query.length) vars.s = query;
-    if (genreIn.length) vars.g = genreIn;
-    var d = await this.anilist(q, vars);
-    return { list: this._mapList(d.data.Page.media), hasNextPage: d.data.Page.pageInfo.hasNextPage };
+    if (hasQuery) { decls += ",$s:String"; args += ",search:$s"; vars.s = query; }
+    if (hasGenre) { decls += ",$g:[String]"; args += ",genre_in:$g"; vars.g = genreIn; }
+
+    var q = "query(" + decls + "){Page(page:$p,perPage:20){pageInfo{hasNextPage}media(" +
+            args + "){id title{romaji english native}coverImage{large extraLarge}}}}";
+    return this._anilistPage(q, vars);
   }
 
   getFilterList() {
@@ -499,7 +535,12 @@ class DefaultExtension extends MProvider {
     // AniList info first (small, fast), then Miruro episodes. Sequential is fine
     // here — the two-request overlap isn't the bottleneck; the decode is.
     var q = "query($id:Int){Media(id:$id,type:ANIME){id title{romaji english native}coverImage{large extraLarge}description(asHtml:false)status genres studios(isMain:true){nodes{name}}nextAiringEpisode{episode airingAt}}}";
-    var alData = await this.anilist(q, { id: parseInt(aniId) });
+    var alData = null;
+    try {
+      alData = await this.anilist(q, { id: parseInt(aniId) });
+    } catch (e) {
+      console.log("Miruro: AniList detail failed: " + e);
+    }
 
     var epData = null;
     try {
@@ -508,7 +549,20 @@ class DefaultExtension extends MProvider {
       console.log("Miruro: episodes fetch failed: " + e);
     }
 
-    var info = alData.data.Media;
+    var info = (alData && alData.data && alData.data.Media) ? alData.data.Media : null;
+    if (!info) {
+      // Without AniList metadata we can still serve episodes if we got them.
+      return {
+        name: "",
+        imageUrl: "",
+        description: "",
+        author: "",
+        status: 5,
+        genre: [],
+        chapters: this._buildChapters(aniId, epData),
+        link: cleanUrl
+      };
+    }
     var name = this._title(info);
     var desc = (info.description || "").replace(/<[^>]+>/g, "");
     var studio = info.studios && info.studios.nodes && info.studios.nodes.length > 0 ? info.studios.nodes[0].name : "";
