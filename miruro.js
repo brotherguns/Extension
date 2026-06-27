@@ -211,33 +211,50 @@ function deobfuscate(body) {
   var deflateData = compressed.subarray(offset, compressed.length - 8);
   if (deflateData.length === 0) throw new Error("deobfuscate: empty deflate stream");
   var inflated = tinf.inflate(deflateData, isize + 64);
-  // Proper UTF-8 decode — use array + join for performance
-  var parts = [];
-  var i = 0;
-  var chunk = "";
-  var n = inflated.length;
-  while (i < n) {
-    var c = inflated[i];
-    if (c < 128) {
-      chunk += String.fromCharCode(c);
-      i++;
-    } else if (c < 224) {
-      chunk += String.fromCharCode(((c & 31) << 6) | (inflated[i+1] & 63));
-      i += 2;
-    } else if (c < 240) {
-      chunk += String.fromCharCode(((c & 15) << 12) | ((inflated[i+1] & 63) << 6) | (inflated[i+2] & 63));
-      i += 3;
-    } else {
-      var cp = ((c & 7) << 18) | ((inflated[i+1] & 63) << 12) | ((inflated[i+2] & 63) << 6) | (inflated[i+3] & 63);
-      cp -= 0x10000;
-      chunk += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
-      i += 4;
-    }
-    if (chunk.length > 8192) { parts.push(chunk); chunk = ""; }
-  }
-  if (chunk) parts.push(chunk);
-  return parts.join("").replace(/\0+$/, "");
+  return utf8Decode(inflated).replace(/\0+$/, "");
 }
+
+// UTF-8 byte array -> string. Prefers native TextDecoder (orders of magnitude
+// faster than a hand-rolled loop in QuickJS), falls back to manual decode.
+var utf8Decode = (function() {
+  if (typeof TextDecoder !== "undefined") {
+    var dec = new TextDecoder("utf-8");
+    return function(bytes) { return dec.decode(bytes); };
+  }
+  // ES5 fallback. Bulk-decodes ASCII runs with fromCharCode.apply (far faster
+  // than per-byte concat in QuickJS); only multi-byte sequences go char-by-char.
+  return function(inflated) {
+    var parts = [];
+    var code = [];
+    var i = 0;
+    var n = inflated.length;
+    while (i < n) {
+      var c = inflated[i];
+      if (c < 128) {
+        code.push(c);
+        i++;
+      } else if (c < 224) {
+        code.push(((c & 31) << 6) | (inflated[i+1] & 63));
+        i += 2;
+      } else if (c < 240) {
+        code.push(((c & 15) << 12) | ((inflated[i+1] & 63) << 6) | (inflated[i+2] & 63));
+        i += 3;
+      } else {
+        var cp = ((c & 7) << 18) | ((inflated[i+1] & 63) << 12) | ((inflated[i+2] & 63) << 6) | (inflated[i+3] & 63);
+        cp -= 0x10000;
+        code.push(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
+        i += 4;
+      }
+      // Flush in bounded slices — apply() on huge arrays can overflow the stack.
+      if (code.length >= 8192) {
+        parts.push(String.fromCharCode.apply(null, code));
+        code.length = 0;
+      }
+    }
+    if (code.length) parts.push(String.fromCharCode.apply(null, code));
+    return parts.join("");
+  };
+})();
 
 // ─── Extension ──────────────────────────────────────────────────────────
 
@@ -476,17 +493,17 @@ class DefaultExtension extends MProvider {
 
     if (this._detailCache[aniId]) return this._detailCache[aniId];
 
-    // Fire AniList info + Miruro episodes concurrently — they're independent.
+    // AniList info first (small, fast), then Miruro episodes. Kept sequential for
+    // engine portability — Promise.all timing isn't the bottleneck here.
     var q = "query($id:Int){Media(id:$id,type:ANIME){id title{romaji english native}coverImage{large extraLarge}description(asHtml:false)status genres studios(isMain:true){nodes{name}}nextAiringEpisode{episode airingAt}}}";
-    var alPromise = this.anilist(q, { id: parseInt(aniId) });
-    var epPromise = this.pipe("episodes", { anilistId: aniId }).then(
-      function(r) { return r; },
-      function(e) { console.log("Miruro: episodes fetch failed: " + e); return null; }
-    );
+    var alData = await this.anilist(q, { id: parseInt(aniId) });
 
-    var results = await Promise.all([alPromise, epPromise]);
-    var alData = results[0];
-    var epData = results[1];
+    var epData = null;
+    try {
+      epData = await this.pipe("episodes", { anilistId: aniId });
+    } catch (e) {
+      console.log("Miruro: episodes fetch failed: " + e);
+    }
 
     var info = alData.data.Media;
     var name = this._title(info);
