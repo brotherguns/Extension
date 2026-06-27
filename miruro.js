@@ -214,8 +214,11 @@ function deobfuscate(body) {
   return utf8Decode(inflated).replace(/\0+$/, "");
 }
 
-// UTF-8 byte array -> string. Prefers native TextDecoder (orders of magnitude
-// faster than a hand-rolled loop in QuickJS), falls back to manual decode.
+// UTF-8 byte array -> string. The AnymeX/QuickJS engine has no TextDecoder, so
+// the ES5 path below is what actually runs; the TextDecoder branch is kept only
+// as a fast path for engines that do provide it. The ES5 path decodes multibyte
+// sequences into code points manually (correct, unlike a raw fromCharCode bulk
+// over UTF-8 bytes) and bulk-emits via fromCharCode.apply in bounded slices.
 var utf8Decode = (function() {
   if (typeof TextDecoder !== "undefined") {
     var dec = new TextDecoder("utf-8");
@@ -493,8 +496,8 @@ class DefaultExtension extends MProvider {
 
     if (this._detailCache[aniId]) return this._detailCache[aniId];
 
-    // AniList info first (small, fast), then Miruro episodes. Kept sequential for
-    // engine portability — Promise.all timing isn't the bottleneck here.
+    // AniList info first (small, fast), then Miruro episodes. Sequential is fine
+    // here — the two-request overlap isn't the bottleneck; the decode is.
     var q = "query($id:Int){Media(id:$id,type:ANIME){id title{romaji english native}coverImage{large extraLarge}description(asHtml:false)status genres studios(isMain:true){nodes{name}}nextAiringEpisode{episode airingAt}}}";
     var alData = await this.anilist(q, { id: parseInt(aniId) });
 
