@@ -8,7 +8,7 @@ const mangayomiSources = [
     "iconUrl": "https://www.google.com/s2/favicons?sz=256&domain=https://www.miruro.tv/",
     "typeSource": "single",
     "itemType": 1,
-    "version": "1.0.0",
+    "version": "1.1.0",
     "pkgPath": "anime/src/en/miruro.js"
   }
 ];
@@ -101,16 +101,29 @@ var tinf = (function() {
     tinf_build_tree(dt, lengths, hlit, hdist);
   }
 
+  // Ensure dest has room for `extra` more bytes; grow if needed. Returns d.dest.
+  function tinf_ensure(d, extra) {
+    if (d.destLen + extra <= d.dest.length) return;
+    var newLen = d.dest.length * 2;
+    while (newLen < d.destLen + extra) newLen *= 2;
+    var newDest = new Uint8Array(newLen);
+    newDest.set(d.dest.subarray(0, d.destLen));
+    d.dest = newDest;
+  }
+
   function tinf_inflate_block_data(d, lt, dt) {
     for (;;) {
       var sym = tinf_decode_symbol(d, lt);
       if (sym === 256) return TINF_OK;
-      if (sym < 256) { d.dest[d.destLen++] = sym; }
-      else {
+      if (sym < 256) {
+        tinf_ensure(d, 1);
+        d.dest[d.destLen++] = sym;
+      } else {
         sym -= 257;
         var length = tinf_read_bits(d, length_bits[sym], length_base[sym]);
         var dist = tinf_decode_symbol(d, dt);
         var offs = d.destLen - tinf_read_bits(d, dist_bits[dist], dist_base[dist]);
+        tinf_ensure(d, length);
         for (var i = offs; i < offs + length; ++i) d.dest[d.destLen++] = d.dest[i];
       }
     }
@@ -121,6 +134,7 @@ var tinf = (function() {
     while (d.bitcount > 8) { d.sourceIndex--; d.bitcount -= 8; }
     length = d.source[d.sourceIndex + 1]; length = 256 * length + d.source[d.sourceIndex];
     d.sourceIndex += 4;
+    tinf_ensure(d, length);
     for (var i = length; i; --i) d.dest[d.destLen++] = d.source[d.sourceIndex++];
     d.bitcount = 0;
   }
@@ -132,7 +146,8 @@ var tinf = (function() {
 
   return {
     inflate: function(source, expectedSize) {
-      var dest = new Uint8Array(expectedSize || source.length * 32);
+      var initial = expectedSize && expectedSize > 0 ? expectedSize : Math.max(source.length * 4, 1024);
+      var dest = new Uint8Array(initial);
       var d = new Data(source, dest);
       var bfinal, btype;
       do {
@@ -141,23 +156,27 @@ var tinf = (function() {
         if (btype === 0) tinf_inflate_uncompressed(d);
         else if (btype === 1) tinf_inflate_block_data(d, sltree, sdtree);
         else if (btype === 2) { var lt = new Tree(), dt = new Tree(); tinf_decode_trees(d, lt, dt); tinf_inflate_block_data(d, lt, dt); }
-        if (d.destLen > dest.length - 65536) {
-          var newDest = new Uint8Array(dest.length * 2); newDest.set(dest); dest = newDest; d.dest = newDest;
-        }
       } while (!bfinal);
-      return dest.subarray(0, d.destLen);
+      return d.dest.subarray(0, d.destLen);
     }
   };
 })();
 
-function b64ToBytes(b64) {
+// base64 decode lookup table — built once at module load
+var B64_LOOKUP = (function() {
   var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   var lookup = new Uint8Array(128);
   for (var i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i;
+  return lookup;
+})();
+
+function b64ToBytes(b64) {
+  var lookup = B64_LOOKUP;
   var len = b64.length, pads = 0;
+  if (len === 0) return new Uint8Array(0);
   if (b64[len - 1] === "=") pads++;
   if (b64[len - 2] === "=") pads++;
-  var byteLen = (len * 3 / 4) - pads;
+  var byteLen = ((len * 3) >> 2) - pads;
   var bytes = new Uint8Array(byteLen);
   var p = 0;
   for (var i = 0; i < len; i += 4) {
@@ -173,26 +192,31 @@ function b64ToBytes(b64) {
 function deobfuscate(body) {
   // base64url -> base64
   var b64 = body.replace(/-/g, "+").replace(/_/g, "/");
-  var pad = b64.length % 4;
-  if (pad) b64 += "====".substring(pad);
+  var rem = b64.length % 4;
+  if (rem === 2) b64 += "==";
+  else if (rem === 3) b64 += "=";
+  else if (rem === 1) throw new Error("deobfuscate: invalid base64 length");
   // decode base64 to bytes
   var compressed = b64ToBytes(b64);
+  if (compressed.length < 18) throw new Error("deobfuscate: body too short for gzip");
   // skip gzip header (10 bytes minimum)
   var offset = 10;
   if (compressed[3] & 4) { offset += 2 + compressed[offset] + (compressed[offset+1] << 8); }
-  if (compressed[3] & 8) { while (compressed[offset++] !== 0); }
-  if (compressed[3] & 16) { while (compressed[offset++] !== 0); }
+  if (compressed[3] & 8) { while (offset < compressed.length && compressed[offset++] !== 0); }
+  if (compressed[3] & 16) { while (offset < compressed.length && compressed[offset++] !== 0); }
   if (compressed[3] & 2) offset += 2;
   // Read expected decompressed size from gzip footer (ISIZE, last 4 bytes)
   var isize = compressed[compressed.length-4] | (compressed[compressed.length-3]<<8) | (compressed[compressed.length-2]<<16) | ((compressed[compressed.length-1]<<24)>>>0);
   // inflate the deflate stream
   var deflateData = compressed.subarray(offset, compressed.length - 8);
+  if (deflateData.length === 0) throw new Error("deobfuscate: empty deflate stream");
   var inflated = tinf.inflate(deflateData, isize + 64);
   // Proper UTF-8 decode — use array + join for performance
   var parts = [];
   var i = 0;
   var chunk = "";
-  while (i < inflated.length) {
+  var n = inflated.length;
+  while (i < n) {
     var c = inflated[i];
     if (c < 128) {
       chunk += String.fromCharCode(c);
@@ -222,12 +246,73 @@ class DefaultExtension extends MProvider {
     super();
     this.client = new Client();
     this.anilistUrl = "https://graphql.anilist.co";
-    this.provOrder = ["kiwi", "bonk", "ally", "moo", "hop", "pewe", "bee"];
+    // Default provider order — verified live for HLS reachability + speed.
+    // hop is dead (HTTP 444 on every request); moo returns mp4 only, not HLS.
+    this.provOrder = ["kiwi", "ally", "pewe", "bee", "bonk"];
+    // Session caches (cleared on extension reload).
+    this._epCache = {};
+    this._detailCache = {};
   }
 
   getHeaders(url) {
     return { "Referer": this.source.baseUrl + "/" };
   }
+
+  // ─── Preferences ──────────────────────────────────────────────────────
+
+  _pref(key, def) {
+    try {
+      var v = new SharedPreferences().get(key);
+      return (v === null || v === undefined || v === "") ? def : v;
+    } catch (e) { return def; }
+  }
+
+  getSourcePreferences() {
+    return [
+      {
+        key: "preferred_quality",
+        listPreference: {
+          title: "Preferred quality",
+          summary: "Streams matching this quality are sorted first",
+          valueIndex: 0,
+          entries: ["1080p", "720p", "480p", "360p", "Auto"],
+          entryValues: ["1080", "720", "480", "360", "auto"]
+        }
+      },
+      {
+        key: "preferred_provider",
+        listPreference: {
+          title: "Preferred provider",
+          summary: "Tried first when fetching streams",
+          valueIndex: 0,
+          entries: ["kiwi", "ally", "pewe", "bee", "bonk"],
+          entryValues: ["kiwi", "ally", "pewe", "bee", "bonk"]
+        }
+      },
+      {
+        key: "default_category",
+        listPreference: {
+          title: "Default audio",
+          summary: "Preferred sub/dub when both exist",
+          valueIndex: 0,
+          entries: ["Sub", "Dub"],
+          entryValues: ["sub", "dub"]
+        }
+      },
+      {
+        key: "title_lang",
+        listPreference: {
+          title: "Title language",
+          summary: "Display titles in this language",
+          valueIndex: 0,
+          entries: ["English", "Romaji"],
+          entryValues: ["english", "romaji"]
+        }
+      }
+    ];
+  }
+
+  // ─── Network helpers ──────────────────────────────────────────────────
 
   _b64url(str) {
     var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -250,9 +335,10 @@ class DefaultExtension extends MProvider {
     var url = this.source.baseUrl + "/api/secure/pipe?e=" + encoded;
     var res = await this.client.get(url, this.getHeaders());
     var body = res.body;
-    if (body && body.indexOf("H4sI") === 0) {
-      var decoded = deobfuscate(body);
-      return JSON.parse(decoded);
+    if (!body) return null;
+    // Gzipped+base64url responses start with the gzip magic in base64 ("H4sI").
+    if (body.indexOf("H4sI") === 0) {
+      return JSON.parse(deobfuscate(body));
     }
     return JSON.parse(body);
   }
@@ -266,8 +352,19 @@ class DefaultExtension extends MProvider {
     return JSON.parse(res.body);
   }
 
+  // ─── Mapping helpers ──────────────────────────────────────────────────
+
+  _title(m) {
+    var t = m.title || {};
+    if (this._pref("title_lang", "english") === "romaji") {
+      return t.romaji || t.english || t.native || "Unknown";
+    }
+    return t.english || t.romaji || t.native || "Unknown";
+  }
+
   _makeLink(m) {
-    var slug = (m.title.romaji || "").toLowerCase().replace(/[^a-z0-9]+/g, "-");
+    var t = m.title || {};
+    var slug = (t.romaji || t.english || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
     return "/info/" + m.id + "/" + slug;
   }
 
@@ -275,19 +372,30 @@ class DefaultExtension extends MProvider {
     var list = [];
     for (var i = 0; i < media.length; i++) {
       var m = media[i];
+      if (!m) continue;
+      var img = m.coverImage ? (m.coverImage.large || m.coverImage.extraLarge || "") : "";
       list.push({
-        name: m.title.english || m.title.romaji,
-        imageUrl: m.coverImage.large,
+        name: this._title(m),
+        imageUrl: img,
         link: this._makeLink(m)
       });
     }
     return list;
   }
 
+  _status(s) {
+    // Mangayomi enum: 0 ongoing, 1 completed, 2 onHiatus, 3 canceled, 4 publishingFinished, 5 unknown
+    if (s === "RELEASING") return 0;
+    if (s === "FINISHED") return 1;
+    if (s === "HIATUS") return 2;
+    if (s === "CANCELLED") return 3;
+    return 5;
+  }
+
   // ─── Popular / Latest ─────────────────────────────────────────────────
 
   async getPopular(page) {
-    var q = "query($p:Int){Page(page:$p,perPage:20){pageInfo{hasNextPage}media(type:ANIME,sort:TRENDING_DESC){id title{romaji english}coverImage{large}}}}";
+    var q = "query($p:Int){Page(page:$p,perPage:20){pageInfo{hasNextPage}media(type:ANIME,sort:TRENDING_DESC){id title{romaji english native}coverImage{large extraLarge}}}}";
     var d = await this.anilist(q, { p: page });
     return { list: this._mapList(d.data.Page.media), hasNextPage: d.data.Page.pageInfo.hasNextPage };
   }
@@ -295,17 +403,67 @@ class DefaultExtension extends MProvider {
   get supportsLatest() { return true; }
 
   async getLatestUpdates(page) {
-    var q = "query($p:Int){Page(page:$p,perPage:20){pageInfo{hasNextPage}media(type:ANIME,sort:UPDATED_AT_DESC,status:RELEASING){id title{romaji english}coverImage{large}}}}";
+    var q = "query($p:Int){Page(page:$p,perPage:20){pageInfo{hasNextPage}media(type:ANIME,sort:UPDATED_AT_DESC,status:RELEASING){id title{romaji english native}coverImage{large extraLarge}}}}";
     var d = await this.anilist(q, { p: page });
     return { list: this._mapList(d.data.Page.media), hasNextPage: d.data.Page.pageInfo.hasNextPage };
   }
 
-  // ─── Search ───────────────────────────────────────────────────────────
+  // ─── Search + Filters ─────────────────────────────────────────────────
 
   async search(query, page, filters) {
-    var q = "query($p:Int,$s:String){Page(page:$p,perPage:20){pageInfo{hasNextPage}media(type:ANIME,search:$s){id title{romaji english}coverImage{large}}}}";
-    var d = await this.anilist(q, { p: page, s: query });
+    var genreIn = [];
+    var sort = "SEARCH_MATCH";
+    if (filters && filters.length) {
+      for (var fi = 0; fi < filters.length; fi++) {
+        var f = filters[fi];
+        if (f.type === "GroupFilter" && f.name === "Genres" && f.state) {
+          for (var gi = 0; gi < f.state.length; gi++) {
+            if (f.state[gi].state === true) genreIn.push(f.state[gi].name);
+          }
+        } else if (f.type === "SelectFilter" && f.name === "Sort" && f.values) {
+          var sv = f.values[f.state];
+          if (sv && sv.value) sort = sv.value;
+        }
+      }
+    }
+    // If no text query, default sort to TRENDING for a useful browse experience.
+    if ((!query || query.length === 0) && sort === "SEARCH_MATCH") sort = "TRENDING_DESC";
+
+    var q = "query($p:Int,$s:String,$g:[String],$sort:[MediaSort]){Page(page:$p,perPage:20){pageInfo{hasNextPage}media(type:ANIME" +
+            (query && query.length ? ",search:$s" : "") +
+            (genreIn.length ? ",genre_in:$g" : "") +
+            ",sort:$sort){id title{romaji english native}coverImage{large extraLarge}}}}";
+    var vars = { p: page, sort: [sort] };
+    if (query && query.length) vars.s = query;
+    if (genreIn.length) vars.g = genreIn;
+    var d = await this.anilist(q, vars);
     return { list: this._mapList(d.data.Page.media), hasNextPage: d.data.Page.pageInfo.hasNextPage };
+  }
+
+  getFilterList() {
+    var genres = ["Action","Adventure","Comedy","Drama","Ecchi","Fantasy","Horror","Mahou Shoujo",
+      "Mecha","Music","Mystery","Psychological","Romance","Sci-Fi","Slice of Life","Sports",
+      "Supernatural","Thriller"];
+    var genreFilters = [];
+    for (var i = 0; i < genres.length; i++) {
+      genreFilters.push({ type: "CheckBoxFilter", name: genres[i], value: false, state: false });
+    }
+    return [
+      {
+        type: "SelectFilter",
+        name: "Sort",
+        state: 0,
+        values: [
+          { type: "SelectOption", name: "Default", value: "SEARCH_MATCH" },
+          { type: "SelectOption", name: "Trending", value: "TRENDING_DESC" },
+          { type: "SelectOption", name: "Popular", value: "POPULARITY_DESC" },
+          { type: "SelectOption", name: "Score", value: "SCORE_DESC" },
+          { type: "SelectOption", name: "Newest", value: "START_DATE_DESC" },
+          { type: "SelectOption", name: "Title", value: "TITLE_ROMAJI" }
+        ]
+      },
+      { type: "GroupFilter", name: "Genres", state: genreFilters }
+    ];
   }
 
   // ─── Detail ───────────────────────────────────────────────────────────
@@ -316,121 +474,31 @@ class DefaultExtension extends MProvider {
     if (!match) return { chapters: [] };
     var aniId = match[1];
 
-    // AniList info
-    var q = "query($id:Int){Media(id:$id,type:ANIME){id title{romaji english native}coverImage{large extraLarge}description(asHtml:false)status genres studios(isMain:true){nodes{name}}}}";
-    var alData = await this.anilist(q, { id: parseInt(aniId) });
+    if (this._detailCache[aniId]) return this._detailCache[aniId];
+
+    // Fire AniList info + Miruro episodes concurrently — they're independent.
+    var q = "query($id:Int){Media(id:$id,type:ANIME){id title{romaji english native}coverImage{large extraLarge}description(asHtml:false)status genres studios(isMain:true){nodes{name}}nextAiringEpisode{episode airingAt}}}";
+    var alPromise = this.anilist(q, { id: parseInt(aniId) });
+    var epPromise = this.pipe("episodes", { anilistId: aniId }).then(
+      function(r) { return r; },
+      function(e) { console.log("Miruro: episodes fetch failed: " + e); return null; }
+    );
+
+    var results = await Promise.all([alPromise, epPromise]);
+    var alData = results[0];
+    var epData = results[1];
+
     var info = alData.data.Media;
-    var name = info.title.english || info.title.romaji;
+    var name = this._title(info);
     var desc = (info.description || "").replace(/<[^>]+>/g, "");
     var studio = info.studios && info.studios.nodes && info.studios.nodes.length > 0 ? info.studios.nodes[0].name : "";
-    var status = info.status === "RELEASING" ? 0 : info.status === "FINISHED" ? 1 : 5;
+    var status = this._status(info.status);
 
-    // Episodes from Miruro — only process reliable providers
-    var epData = await this.pipe("episodes", { anilistId: aniId });
-    var chapters = [];
+    var chapters = this._buildChapters(aniId, epData);
 
-    if (epData && epData.providers) {
-      var epMap = {};
-      // Only process known-good providers to avoid slowdown
-      var useProvs = ["kiwi", "bee", "bonk", "ally", "pewe", "moo"];
-      var provKeys = Object.keys(epData.providers);
-
-      console.log("Miruro: providers found: " + provKeys.join(", "));
-
-      for (var pi = 0; pi < useProvs.length; pi++) {
-        var pn = useProvs[pi];
-        var prov = epData.providers[pn];
-        if (!prov || !prov.episodes) continue;
-
-        var catKeys = Object.keys(prov.episodes);
-        console.log("Miruro: " + pn + " categories: " + catKeys.join(", "));
-
-        for (var ci = 0; ci < catKeys.length; ci++) {
-          var cat = catKeys[ci];
-          if (cat !== "sub" && cat !== "dub" && cat !== "ssub") continue;
-          var eps = prov.episodes[cat];
-          if (!eps || !eps.length) continue;
-
-          var isDub = (cat === "dub");
-
-          for (var i = 0; i < eps.length; i++) {
-            var ep = eps[i];
-            var num = ep.number;
-            if (!epMap[num]) {
-              epMap[num] = { title: "", sub: [], dub: [] };
-            }
-            if (ep.title && ep.title.length > 0 && epMap[num].title.length === 0) {
-              epMap[num].title = ep.title;
-            }
-            var srcEntry = { prov: pn, eid: ep.id, cat: isDub ? "dub" : "sub" };
-            if (isDub) {
-              epMap[num].dub.push(srcEntry);
-            } else {
-              epMap[num].sub.push(srcEntry);
-            }
-          }
-        }
-      }
-
-      // Sort episode numbers
-      var epNums = [];
-      var epKeys = Object.keys(epMap);
-      for (var i = 0; i < epKeys.length; i++) epNums.push(parseFloat(epKeys[i]));
-      epNums.sort(function(a, b) { return a - b; });
-
-      // Log counts for debug
-      if (epNums.length > 0) {
-        var firstEp = epMap[epNums[0]];
-        console.log("Miruro: ep " + epNums[0] + " has " + firstEp.sub.length + " sub, " + firstEp.dub.length + " dub sources");
-      }
-
-      // Create one chapter per episode — limit sources to top providers
-      var topProvs = ["kiwi", "bee", "bonk", "ally", "pewe"];
-      for (var ni = 0; ni < epNums.length; ni++) {
-        var num = epNums[ni];
-        var data = epMap[num];
-        if (data.sub.length === 0 && data.dub.length === 0) continue;
-
-        var epTitle = data.title || ("Episode " + num);
-
-        // Pick top 3 sub + top 2 dub sources (prioritize reliable providers)
-        var pickTop = function(arr, max) {
-          var picked = [];
-          for (var p = 0; p < topProvs.length && picked.length < max; p++) {
-            for (var a = 0; a < arr.length; a++) {
-              if (arr[a].prov === topProvs[p]) { picked.push(arr[a]); break; }
-            }
-          }
-          // Fill remaining from whatever's left
-          for (var a = 0; a < arr.length && picked.length < max; a++) {
-            var dup = false;
-            for (var d = 0; d < picked.length; d++) { if (picked[d].prov === arr[a].prov) { dup = true; break; } }
-            if (!dup) picked.push(arr[a]);
-          }
-          return picked;
-        };
-
-        var bestSub = pickTop(data.sub, 3);
-        var bestDub = pickTop(data.dub, 2);
-        var allSources = bestSub.concat(bestDub);
-
-        var tags = [];
-        if (bestSub.length > 0) tags.push("SUB");
-        if (bestDub.length > 0) tags.push("DUB");
-
-        chapters.push({
-          name: "E" + num + " - " + epTitle,
-          url: JSON.stringify({ aid: aniId, num: num, sources: allSources }),
-          scanlator: tags.join("+") + " · " + allSources.length + " sources"
-        });
-      }
-    }
-
-    console.log("Miruro: " + chapters.length + " eps for " + aniId);
-
-    return {
+    var result = {
       name: name,
-      imageUrl: info.coverImage.extraLarge || info.coverImage.large,
+      imageUrl: (info.coverImage && (info.coverImage.extraLarge || info.coverImage.large)) || "",
       description: desc,
       author: studio,
       status: status,
@@ -438,6 +506,97 @@ class DefaultExtension extends MProvider {
       chapters: chapters,
       link: cleanUrl
     };
+    this._detailCache[aniId] = result;
+    return result;
+  }
+
+  _buildChapters(aniId, epData) {
+    var chapters = [];
+    if (!epData || !epData.providers) return chapters;
+
+    var epMap = {};
+    var useProvs = this.provOrder;
+
+    for (var pi = 0; pi < useProvs.length; pi++) {
+      var pn = useProvs[pi];
+      var prov = epData.providers[pn];
+      if (!prov || !prov.episodes) continue;
+
+      var catKeys = Object.keys(prov.episodes);
+      for (var ci = 0; ci < catKeys.length; ci++) {
+        var cat = catKeys[ci];
+        if (cat !== "sub" && cat !== "dub" && cat !== "ssub") continue;
+        var eps = prov.episodes[cat];
+        if (!eps || !eps.length) continue;
+
+        var isDub = (cat === "dub");
+
+        for (var i = 0; i < eps.length; i++) {
+          var ep = eps[i];
+          // Guard against missing/invalid episode numbers — they corrupt keying & sorting.
+          var num = ep.number;
+          if (num === null || num === undefined) continue;
+          var numF = parseFloat(num);
+          if (isNaN(numF)) continue;
+          var key = String(numF);
+
+          if (!epMap[key]) {
+            epMap[key] = { num: numF, title: "", sub: [], dub: [] };
+          }
+          if (ep.title && ep.title.length > 0 && epMap[key].title.length === 0) {
+            epMap[key].title = ep.title;
+          }
+          // Preserve the original category (ssub kept distinct from sub).
+          var srcEntry = { prov: pn, eid: ep.id, cat: cat };
+          if (isDub) epMap[key].dub.push(srcEntry);
+          else epMap[key].sub.push(srcEntry);
+        }
+      }
+    }
+
+    // Sort by numeric episode number.
+    var keys = Object.keys(epMap);
+    var entries = [];
+    for (var k = 0; k < keys.length; k++) entries.push(epMap[keys[k]]);
+    entries.sort(function(a, b) { return a.num - b.num; });
+
+    var topProvs = this.provOrder;
+    var pickTop = function(arr, max) {
+      var picked = [];
+      for (var p = 0; p < topProvs.length && picked.length < max; p++) {
+        for (var a = 0; a < arr.length; a++) {
+          if (arr[a].prov === topProvs[p]) { picked.push(arr[a]); break; }
+        }
+      }
+      for (var a = 0; a < arr.length && picked.length < max; a++) {
+        var dup = false;
+        for (var dd = 0; dd < picked.length; dd++) { if (picked[dd].prov === arr[a].prov) { dup = true; break; } }
+        if (!dup) picked.push(arr[a]);
+      }
+      return picked;
+    };
+
+    for (var ni = 0; ni < entries.length; ni++) {
+      var data = entries[ni];
+      if (data.sub.length === 0 && data.dub.length === 0) continue;
+
+      var epTitle = data.title || ("Episode " + data.num);
+      var bestSub = pickTop(data.sub, 3);
+      var bestDub = pickTop(data.dub, 2);
+      var allSources = bestSub.concat(bestDub);
+
+      var tags = [];
+      if (bestSub.length > 0) tags.push("SUB");
+      if (bestDub.length > 0) tags.push("DUB");
+
+      chapters.push({
+        name: "E" + data.num + " - " + epTitle,
+        url: JSON.stringify({ aid: aniId, num: data.num, sources: allSources }),
+        scanlator: tags.join("+") + " · " + allSources.length + " sources"
+      });
+    }
+
+    return chapters;
   }
 
   // ─── Video List ───────────────────────────────────────────────────────
@@ -446,52 +605,101 @@ class DefaultExtension extends MProvider {
     var ep;
     try { ep = JSON.parse(url); } catch(e) { return []; }
 
-    var videos = [];
     var sources = ep.sources || [];
-    // Prioritize reliable providers, skip known-flaky ones
-    var reliable = ["kiwi", "bee", "bonk", "ally", "pewe"];
+    if (!sources.length) return [];
+
+    var prefProv = this._pref("preferred_provider", "");
+    var prefCat = this._pref("default_category", "sub");
+
+    // Order sources: user-preferred provider first, then verified reliability order.
+    var order = [];
+    if (prefProv) order.push(prefProv);
+    for (var o = 0; o < this.provOrder.length; o++) {
+      if (this.provOrder[o] !== prefProv) order.push(this.provOrder[o]);
+    }
     var sorted = [];
-    // Add reliable first
-    for (var ri = 0; ri < reliable.length; ri++) {
+    for (var ri = 0; ri < order.length; ri++) {
       for (var si = 0; si < sources.length; si++) {
-        if (sources[si].prov === reliable[ri]) sorted.push(sources[si]);
+        if (sources[si].prov === order[ri]) sorted.push(sources[si]);
       }
     }
-    // Add remaining
     for (var si = 0; si < sources.length; si++) {
-      var dominated = false;
-      for (var ri = 0; ri < reliable.length; ri++) {
-        if (sources[si].prov === reliable[ri]) { dominated = true; break; }
-      }
-      if (!dominated) sorted.push(sources[si]);
+      var seen = false;
+      for (var ti = 0; ti < sorted.length; ti++) { if (sorted[ti] === sources[si]) { seen = true; break; } }
+      if (!seen) sorted.push(sources[si]);
     }
 
-    // Try max 4 sources, stop early if we already have streams
-    var maxTries = Math.min(sorted.length, 4);
+    // Prefer the user's audio choice ordering within the same provider priority.
+    sorted.sort(function(a, b) {
+      var aPref = (a.cat === prefCat || (prefCat === "sub" && a.cat === "ssub")) ? 0 : 1;
+      var bPref = (b.cat === prefCat || (prefCat === "sub" && b.cat === "ssub")) ? 0 : 1;
+      return aPref - bPref;
+    });
+
+    // Fetch up to 5 providers CONCURRENTLY — verified safe (~0.32s for 5 parallel,
+    // no rate-limiting), ~5x faster than sequential. 5 covers all reliable providers
+    // so subtitle-carrying sources (e.g. bee) stay in the fetch window.
+    var maxTries = Math.min(sorted.length, 5);
+    var batch = [];
+    var self = this;
     for (var si = 0; si < maxTries; si++) {
-      var src = sorted[si];
-      try {
-        var srcData = await this.pipe("sources", {
-          episodeId: src.eid, provider: src.prov,
-          category: src.cat || "", anilistId: ep.aid
-        });
-        if (srcData && srcData.streams) {
-          for (var i = 0; i < srcData.streams.length; i++) {
-            var s = srcData.streams[i];
-            if (s.type === "hls" && s.url && s.isActive !== false) {
-              var label = src.prov + " " + (s.quality || "") + " [" + (s.audio || src.cat || "sub").toUpperCase() + "]";
-              if (s.fansub) label += " " + s.fansub;
-              var hdrs = {};
-              if (s.referer) hdrs["Referer"] = s.referer;
-              videos.push({ url: s.url, originalUrl: s.url, quality: label, headers: hdrs });
-            }
-          }
-        }
-      } catch(e) {
-        console.log("Miruro: " + src.prov + " failed: " + e);
+      (function(src) {
+        batch.push(
+          self.pipe("sources", {
+            episodeId: src.eid, provider: src.prov,
+            category: src.cat || "", anilistId: ep.aid
+          }).then(
+            function(data) { return { src: src, data: data }; },
+            function(e) { console.log("Miruro: " + src.prov + " failed: " + e); return null; }
+          )
+        );
+      })(sorted[si]);
+    }
+
+    var settled = await Promise.all(batch);
+
+    var videos = [];
+    var prefQuality = this._pref("preferred_quality", "auto");
+    for (var r = 0; r < settled.length; r++) {
+      var item = settled[r];
+      if (!item || !item.data || !item.data.streams) continue;
+      var src = item.src;
+      var sd = item.data;
+
+      // Collect subtitle tracks once per source (shared across its streams).
+      var subs = [];
+      var subArr = sd.subtitles || sd.tracks || sd.captions || [];
+      for (var su = 0; su < subArr.length; su++) {
+        var t = subArr[su];
+        var file = t.url || t.file || t.src;
+        if (!file) continue;
+        var lbl = t.lang || t.label || t.language || t.name || "Subtitle";
+        if (t.kind === "thumbnails" || lbl === "thumbnails") continue;
+        subs.push({ file: file, label: lbl });
       }
-      // If we have enough streams, stop early
-      if (videos.length >= 4) break;
+
+      for (var i = 0; i < sd.streams.length; i++) {
+        var s = sd.streams[i];
+        if (s.type === "hls" && s.url && s.isActive !== false) {
+          var qual = s.quality || "";
+          var label = src.prov + " " + qual + " [" + (s.audio || src.cat || "sub").toUpperCase() + "]";
+          if (s.fansub) label += " " + s.fansub;
+          var hdrs = {};
+          if (s.referer) hdrs["Referer"] = s.referer;
+          var vid = { url: s.url, originalUrl: s.url, quality: label, headers: hdrs };
+          if (subs.length) vid.subtitles = subs;
+          videos.push(vid);
+        }
+      }
+    }
+
+    // Sort streams by the user's preferred quality (matching quality first).
+    if (prefQuality && prefQuality !== "auto") {
+      videos.sort(function(a, b) {
+        var am = a.quality.indexOf(prefQuality) !== -1 ? 0 : 1;
+        var bm = b.quality.indexOf(prefQuality) !== -1 ? 0 : 1;
+        return am - bm;
+      });
     }
 
     return videos;
@@ -500,6 +708,4 @@ class DefaultExtension extends MProvider {
   // ─── Stubs ────────────────────────────────────────────────────────────
 
   async getPageList(url) { return []; }
-  getFilterList() { return []; }
-  getSourcePreferences() { return []; }
 }
